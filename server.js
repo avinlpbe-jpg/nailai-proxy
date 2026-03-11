@@ -1,18 +1,12 @@
 // NailAI Proxy — Full Server (Node 20)
-// ------------------------------------
-// Features:
-// - CORS + OPTIONS
-// - Google Gemini v1 payload (role: "user")
-// - fetch timeout + retry/backoff on 503/502
-// - model fallback chain (ENV first, then 1.5-flash-8b, 2.0-flash-lite)
-// - forwards original HTTP status from Google to client
-// - detailed logs to Render Logs
+// CORS + OPTIONS, v1 payload (role:"user"), retry/backoff, model fallback,
+// /debug/models to list available models for your API key, and logs.
 
 const http = require("http");
 const url = require("url");
 
 const PORT  = process.env.PORT || 10000;
-const KEY   = process.env.GOOGLE_AI_KEY; // set in Render Environment
+const KEY   = process.env.GOOGLE_AI_KEY;                // חייב להיות מוגדר ב-Render
 const PRIMARY_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 
 // ---- CORS ----
@@ -27,16 +21,10 @@ function send(res, status, body, extraHeaders = {}) {
   res.end(JSON.stringify(body));
 }
 
-// ---- Small helpers ----
-function unique(arr) {
-  return Array.from(new Set(arr.filter(Boolean)));
-}
+// ---- helpers ----
+function unique(arr) { return Array.from(new Set(arr.filter(Boolean))); }
+const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function delay(ms) {
-  return new Promise(res => setTimeout(res, ms));
-}
-
-// fetch with timeout and retry for transient 503/502
 async function fetchWithRetry(url, init, retries = 3) {
   let last;
   for (let attempt = 0; attempt < retries; attempt++) {
@@ -48,91 +36,78 @@ async function fetchWithRetry(url, init, retries = 3) {
 
       if (r.status === 503 || r.status === 502) {
         last = r;
-        const backoff = 600 * (1 << attempt); // 600ms, 1200ms, 2400ms
-        console.log(`[Retry] transient ${r.status}. attempt=${attempt + 1}/${retries} backoff=${backoff}ms`);
+        const backoff = 600 * (1 << attempt);
+        console.log(`[Retry] transient ${r.status}. attempt=${attempt+1}/${retries} backoff=${backoff}ms`);
         await delay(backoff);
         continue;
       }
-      return r; // any non 503/502 status (including 200, 400, 401, 403, 429)
+      return r; // 200/400/401/403/404/429...
     } catch (e) {
       last = e;
       const backoff = 600 * (1 << attempt);
-      console.log(`[Retry] network/timeout (${e?.name || e}). attempt=${attempt + 1}/${retries} backoff=${backoff}ms`);
+      console.log(`[Retry] network/timeout (${e?.name || e}). attempt=${attempt+1}/${retries} backoff=${backoff}ms`);
       await delay(backoff);
     }
   }
-  // after retries, if last is a Response return it, else throw
-  if (last && typeof last === "object" && typeof last.status === "number") {
-    return last;
-  }
+  if (last && typeof last === "object" && typeof last.status === "number") return last;
   throw last;
 }
 
-// ---- Core handler ----
+// ---- Gemini v1 call ----
+async function callGemini(model, prompt) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${KEY}`;
+  const payload = {
+    contents: [{ role: "user", parts: [{ text: prompt }]}]
+  };
+  return fetchWithRetry(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+}
+
+// ---- /prompt handler ----
 async function handlePrompt(req, res, body) {
   try {
-    if (!KEY) {
-      return send(res, 500, { error: "server_misconfig", details: "GOOGLE_AI_KEY is missing" });
-    }
+    if (!KEY) return send(res, 500, { error: "server_misconfig", details: "GOOGLE_AI_KEY is missing" });
 
     const { style, shape, purpose, decorations = [] } = JSON.parse(body || "{}");
-
     const prompt =
 `Short photorealistic nail-art image prompt (<=160 chars).
 Style: ${style}; Shape: ${shape}; Purpose: ${purpose}; Decorations: ${Array.isArray(decorations) ? decorations.join(", ") : ""}.
 Studio background, soft natural light.`.trim();
 
-    // v1 schema requires role: 'user'
-    const payload = {
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: prompt }]
-        }
-      ]
-    };
+    // סדר מודלים: ENV → 2.0-flash → 2.0-flash-lite → 1.5-flash → 1.5-pro (לבחינת זמינות)
+    const candidates = unique([
+      PRIMARY_MODEL,
+      "gemini-2.0-flash",
+      "gemini-2.0-flash-lite",
+      "gemini-1.5-flash",
+      "gemini-1.5-pro"
+    ]);
 
-    // Fallback chain: ENV (primary) → 1.5-flash-8b → 2.0-flash-lite
-    const models = unique([PRIMARY_MODEL, "gemini-1.5-flash-8b", "gemini-2.0-flash-lite"]);
-    let lastResponse;
-    let lastData;
-
-    for (const model of models) {
-      const endpoint = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${KEY}`;
+    let lastResp, lastData;
+    for (const model of candidates) {
       console.log(`[Gemini] calling model=${model}`);
-
-      const r = await fetchWithRetry(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
+      const r = await callGemini(model, prompt);
       const data = await r.json().catch(() => ({}));
       console.log(`[Gemini] status: ${r.status} model: ${model}`);
-      if (!r.ok) {
-        console.log(`[Gemini] error body: ${JSON.stringify(data)}`);
-      }
+      if (!r.ok) console.log(`[Gemini] error body: ${JSON.stringify(data)}`);
 
-      // If ok → return prompt
       if (r.ok) {
         const text = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
         return send(res, 200, { prompt: text, modelUsed: model });
       }
 
-      // If transient (503/502) → try next model
-      if (r.status === 503 || r.status === 502) {
-        lastResponse = r; lastData = data;
-        console.log(`[Gemini] transient ${r.status} on ${model}, trying next fallback if any...`);
-        continue;
-      }
-
-      // Non-transient error (401/403/429/400/…) → break and forward it
-      lastResponse = r; lastData = data;
-      break;
+      // אם מודל לא נמצא/לא נתמך (404/400 עם NOT_FOUND/unsupported) → נסה הבא
+      if (r.status === 404 || r.status === 400) { lastResp = r; lastData = data; continue; }
+      // זמני (503/502) → ננסה הבא
+      if (r.status === 503 || r.status === 502) { lastResp = r; lastData = data; continue; }
+      // שגיאות אחרות (401/403/429...) → עצר והחזר
+      lastResp = r; lastData = data; break;
     }
 
-    // If reached here, forward last error/status from Google
-    const status = lastResponse?.status ?? 502;
+    const status = lastResp?.status ?? 502;
     return send(res, status, { error: "gemini_api_error", details: lastData || { message: "Unknown error" } });
 
   } catch (e) {
@@ -141,19 +116,37 @@ Studio background, soft natural light.`.trim();
   }
 }
 
-// ---- HTTP server ----
+// ---- /debug/models: מחזיר רשימת מודלים זמינים ל-KEY ----
+async function handleListModels(req, res) {
+  try {
+    if (!KEY) return send(res, 500, { error: "server_misconfig", details: "GOOGLE_AI_KEY is missing" });
+    const endpoint = `https://generativelanguage.googleapis.com/v1/models?key=${KEY}`;
+    const r = await fetchWithRetry(endpoint, { method: "GET" });
+    const data = await r.json().catch(() => ({}));
+    console.log(`[Models] status: ${r.status}`);
+    if (!r.ok) console.log(`[Models] error: ${JSON.stringify(data)}`);
+    return send(res, r.status, data);
+  } catch (e) {
+    console.log("[Models] exception:", e);
+    return send(res, 500, { error: "server_error", details: String(e) });
+  }
+}
+
+// ---- HTTP Server ----
 const server = http.createServer((req, res) => {
   const u = url.parse(req.url, true);
 
   // Preflight
-  if (req.method === "OPTIONS") {
-    res.writeHead(204, CORS_HEADERS);
-    return res.end();
-  }
+  if (req.method === "OPTIONS") { res.writeHead(204, CORS_HEADERS); return res.end(); }
 
   // Health
   if (req.method === "GET" && (u.pathname === "/" || u.pathname === "/health")) {
     return send(res, 200, { ok: true, model: PRIMARY_MODEL });
+  }
+
+  // Debug: list models available for this key
+  if (req.method === "GET" && u.pathname === "/debug/models") {
+    return handleListModels(req, res);
   }
 
   // Prompt
