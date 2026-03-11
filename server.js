@@ -5,59 +5,82 @@ const PORT  = process.env.PORT || 10000;
 const KEY   = process.env.GOOGLE_AI_KEY;
 const MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
 
-// כותרות CORS לשימוש בכל תשובה
+// CORS
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type"
 };
 
+function send(res, status, body, extraHeaders = {}) {
+  res.writeHead(status, { "Content-Type": "application/json", ...CORS_HEADERS, ...extraHeaders });
+  res.end(JSON.stringify(body));
+}
+
 async function handlePrompt(req, res, body) {
   try {
     const { style, shape, purpose, decorations = [] } = JSON.parse(body || "{}");
 
-    const prompt = `Short photorealistic nail-art image prompt (<=160 chars).
+    const prompt =
+`Short photorealistic nail-art image prompt (<=160 chars).
 Style: ${style}; Shape: ${shape}; Purpose: ${purpose}; Decorations: ${decorations.join(", ")}.
 Studio background, soft light.`;
 
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1/models/${MODEL}:generateContent?key=${KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }]
-        })
-      }
-    );
+    // 🔹 v1 schema requires role: 'user'
+    const payload = {
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: prompt }]
+        }
+      ]
+    };
 
-    const data = await r.json();
+    const endpoint = `https://generativelanguage.googleapis.com/v1/models/${MODEL}:generateContent?key=${KEY}`;
+
+    const r = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await r.json().catch(() => ({}));
+
+    // 🔹 לוגים לדיאגנוסטיקה ב-Render
+    console.log("[Gemini] status:", r.status, "model:", MODEL);
+    if (r.status !== 200) {
+      console.log("[Gemini] error body:", JSON.stringify(data));
+    }
+
+    if (!r.ok) {
+      // מחזירים ללקוח את הסטטוס המקורי (401/403/429/400…)
+      return send(res, r.status, { error: "gemini_api_error", details: data });
+    }
+
     const text = (data?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+    return send(res, 200, { prompt: text });
 
-    res.writeHead(r.ok ? 200 : 502, { "Content-Type": "application/json", ...CORS_HEADERS });
-    res.end(JSON.stringify(r.ok ? { prompt: text } : { error: "gemini_api_error", details: data }));
   } catch (e) {
-    res.writeHead(500, { "Content-Type": "application/json", ...CORS_HEADERS });
-    res.end(JSON.stringify({ error: "server_error", details: String(e) }));
+    console.log("[Server] exception:", e);
+    return send(res, 500, { error: "server_error", details: String(e) });
   }
 }
 
 const server = http.createServer((req, res) => {
   const u = url.parse(req.url, true);
 
-  // טיפול ב‑preflight
+  // Preflight
   if (req.method === "OPTIONS") {
     res.writeHead(204, CORS_HEADERS);
     return res.end();
   }
 
-  // בריאות
+  // Health
   if (req.method === "GET" && (u.pathname === "/" || u.pathname === "/health")) {
-    res.writeHead(200, { "Content-Type": "application/json", ...CORS_HEADERS });
-    return res.end(JSON.stringify({ ok: true, model: MODEL }));
+    return send(res, 200, { ok: true, model: MODEL });
   }
 
-  // יצירת prompt
+  // Prompt
   if (req.method === "POST" && u.pathname === "/prompt") {
     let body = "";
     req.on("data", ch => (body += ch));
@@ -65,8 +88,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  res.writeHead(404, { "Content-Type": "text/plain", ...CORS_HEADERS });
-  res.end("Not found");
+  send(res, 404, { error: "not_found" });
 });
 
 server.listen(PORT, () => console.log("NailAI proxy listening on", PORT));
