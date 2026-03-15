@@ -163,3 +163,17 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () =>
   console.log("NailAI Leonardo Proxy running on", PORT)
 );
+// --- Leonardo Key Test ---
+async function handleLeonardoTest(req, res) {
+  if (!L_KEY) return send(res, 500, { error: "missing_LEONARDO_KEY" });
+
+  const { r, data } = await fetchJSON("https://cloud.leonardo.ai/api/rest/v1/me", {
+    method: "GET",
+    headers: {
+      "Authorization": `Bearer ${L_KEY}`,
+      "Accept": "application/json"
+    }
+  });
+
+  return send(res, r.status, data);
+}
