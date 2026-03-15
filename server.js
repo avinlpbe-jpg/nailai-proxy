@@ -1,8 +1,8 @@
 // NailAI Proxy — Full Server (Node 20)
 // - CORS + OPTIONS
-// - /prompt → Google Gemini v1 (role:"user"), retry + fallback
-// - /image  → Replicate REST (owner/model), polling עד URL של תמונה
-// - /debug/models → רשימת מודלים זמינים ל-KEY של Gemini
+// - /prompt → Google Gemini v1 (role:"user"), retry + fallback סדר מודלים
+// - /image  → Replicate; אם אין קרדיט/402 → Fallback ל‑Fal.ai
+// - /debug/models → רשימת מודלים זמינים ל‑Gemini
 // - לוגים מפורטים ומחזיר סטטוס מקורי ללקוח
 
 const http = require("http");
@@ -11,12 +11,16 @@ const url = require("url");
 const PORT  = process.env.PORT || 10000;
 
 // --- Gemini (Text Prompt) ---
-const G_KEY   = process.env.GOOGLE_AI_KEY;                       // חובה להגדיר ב-Render
-const G_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";  // מומלץ 2.5-flash
+const G_KEY   = process.env.GOOGLE_AI_KEY;                      // חובה
+const G_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash"; // מומלץ
 
 // --- Replicate (Image Gen) ---
-const R_TOKEN = process.env.REPLICATE_TOKEN;                     // "r8_..."
+const R_TOKEN = process.env.REPLICATE_TOKEN;                    // "r8_..."
 const R_MODEL = process.env.REPLICATE_MODEL || "black-forest-labs/flux-schnell";
+
+// --- Fal.ai (Image Gen Fallback) ---
+const FAL_KEY   = process.env.FAL_KEY;                          // "Key xxx" (fal dashboard)
+const FAL_MODEL = process.env.FAL_MODEL || "fal-ai/flux/schnell";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -37,7 +41,7 @@ async function fetchWithRetry(targetUrl, init, retries = 3) {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 20000); // 20s timeout
+      const tid = setTimeout(() => controller.abort(), 20000); // 20s
       const r = await fetch(targetUrl, { ...init, signal: controller.signal });
       clearTimeout(tid);
 
@@ -120,9 +124,9 @@ Studio background, soft natural light.`.trim();
   }
 }
 
-/* ------------------------------ /image (Replicate) ------------------------- */
+/* ----------------------- /image (Replicate → Fal Fallback) ----------------- */
 
-async function startReplicatePrediction(modelPath, input) {
+async function replicateStart(modelPath, input) {
   const r = await fetch("https://api.replicate.com/v1/models/" + modelPath + "/predictions", {
     method: "POST",
     headers: {
@@ -135,7 +139,7 @@ async function startReplicatePrediction(modelPath, input) {
   return { ok: r.ok, status: r.status, data };
 }
 
-async function getReplicatePrediction(id) {
+async function replicateGet(id) {
   const r = await fetch("https://api.replicate.com/v1/predictions/" + id, {
     method: "GET",
     headers: { "Authorization": `Token ${R_TOKEN}` }
@@ -144,49 +148,120 @@ async function getReplicatePrediction(id) {
   return { ok: r.ok, status: r.status, data };
 }
 
+async function falGenerate(prompt, width, height, steps, guidance) {
+  if (!FAL_KEY) return { ok: false, status: 500, data: { error: "fal_key_missing" } };
+
+  // לפי הדוקומנטציה של Fal, קריאה סינכרונית:
+  // POST https://fal.run/{model_id}  עם Authorization: Key <FAL_KEY>  ומתקבל images[0].url
+  // (נשתמש ב‑fal-ai/flux/schnell כברירת מחדל)  [1](https://docs.fal.ai/model-apis/model-endpoints/synchronous-requests)
+  const endpoint = `https://fal.run/${FAL_MODEL}`;
+  const r = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Authorization": `Key ${FAL_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      prompt,
+      // פרמטרים אופציונליים — מודלים שונים מתעלמים/מתייחסים אחרת; נשאיר מינימלי ואמין.
+      // אפשר להוסיף image_size/num_inference_steps וכו' לפי הצורך. [2](https://docs.fal.ai/model-apis/fast-flux)
+    })
+  });
+
+  const data = await r.json().catch(() => ({}));
+  if (r.ok) {
+    const url = data?.images?.[0]?.url;
+    if (url) return { ok: true, status: 200, data: { imageUrl: url, provider: "fal", modelUsed: FAL_MODEL } };
+    return { ok: false, status: 502, data: { error: "fal_empty_output", raw: data } };
+  }
+  return { ok: false, status: r.status, data };
+}
+
 async function handleImage(req, res, body) {
   try {
-    if (!R_TOKEN) return send(res, 500, { error: "server_misconfig", details: "REPLICATE_TOKEN is missing" });
-
     const { prompt, width = 768, height = 1024, steps = 30, guidance = 7 } = JSON.parse(body || "{}");
 
-    // יצירת prediction
-    const create = await startReplicatePrediction(R_MODEL, {
-      prompt,
-      width,
-      height,
-      num_inference_steps: steps,
-      guidance_scale: guidance
-    });
+    // 1) אם יש טוקן Replicate — ננסה תחילה שם (אולי יש לך קרדיט)
+    if (R_TOKEN) {
+      const create = await replicateStart(R_MODEL, {
+        prompt,
+        width,
+        height,
+        num_inference_steps: steps,
+        guidance_scale: guidance
+      });
 
-    if (!create.ok) {
+      // אם נוצר prediction — נבצע polling עד URL
+      if (create.ok) {
+        const id = create.data.id;
+        for (let i = 0; i < 60; i++) {
+          await delay(2000);
+          const check = await replicateGet(id);
+          if (!check.ok) {
+            // אם יש FAL_KEY — נפיל Fallback מיד
+            if (FAL_KEY) {
+              console.log("[/image] replicate poll error → fallback to Fal");
+              const fal = await falGenerate(prompt, width, height, steps, guidance);
+              return send(res, fal.status, fal.ok ? fal.data : { error: "fal_error", details: fal.data });
+            }
+            return send(res, check.status, { error: "replicate_poll_error", details: check.data });
+          }
+          const st = check.data.status; // starting | processing | succeeded | failed | canceled
+          if (st === "succeeded") {
+            const out = check.data.output;
+            if (Array.isArray(out) && out.length > 0) {
+              return send(res, 200, { imageUrl: out[0], provider: "replicate", modelUsed: R_MODEL });
+            }
+            // אין פלט → נסה Fal אם זמין
+            if (FAL_KEY) {
+              console.log("[/image] replicate empty output → fallback to Fal");
+              const fal = await falGenerate(prompt, width, height, steps, guidance);
+              return send(res, fal.status, fal.ok ? fal.data : { error: "fal_error", details: fal.data });
+            }
+            return send(res, 502, { error: "empty_output" });
+          }
+          if (st === "failed" || st === "canceled") {
+            // כשל → נסה Fal אם זמין
+            if (FAL_KEY) {
+              console.log("[/image] replicate failed/canceled → fallback to Fal");
+              const fal = await falGenerate(prompt, width, height, steps, guidance);
+              return send(res, fal.status, fal.ok ? fal.data : { error: "fal_error", details: fal.data });
+            }
+            return send(res, 502, { error: "replicate_failed", details: check.data.error || check.data });
+          }
+        }
+        // timeout → ננסה Fal אם זמין
+        if (FAL_KEY) {
+          console.log("[/image] replicate timeout → fallback to Fal");
+          const fal = await falGenerate(prompt, width, height, steps, guidance);
+          return send(res, fal.status, fal.ok ? fal.data : { error: "fal_error", details: fal.data });
+        }
+        return send(res, 504, { error: "replicate_timeout" });
+      }
+
+      // create לא הצליח. אם 402/Insufficient credit → Fallback ל‑Fal
+      const insufficient =
+        create.status === 402 ||
+        (typeof create.data?.title === "string" && create.data.title.toLowerCase().includes("insufficient"));
+
+      if (insufficient && FAL_KEY) {
+        console.log("[/image] replicate 402 insufficient credit → fallback to Fal");
+        const fal = await falGenerate(prompt, width, height, steps, guidance);
+        return send(res, fal.status, fal.ok ? fal.data : { error: "fal_error", details: fal.data });
+      }
+
+      // אין FAL או שגיאה אחרת
       return send(res, create.status, { error: "replicate_create_error", details: create.data });
     }
 
-    const id = create.data.id;
-
-    // Polling עד succeeded/failed (עד ~120 שניות)
-    for (let i = 0; i < 60; i++) {
-      await delay(2000);
-      const check = await getReplicatePrediction(id);
-      if (!check.ok) {
-        return send(res, check.status, { error: "replicate_poll_error", details: check.data });
-      }
-      const st = check.data.status; // starting | processing | succeeded | failed | canceled
-      if (st === "succeeded") {
-        const out = check.data.output;
-        if (Array.isArray(out) && out.length > 0) {
-          return send(res, 200, { imageUrl: out[0], provider: "replicate", modelUsed: R_MODEL });
-        }
-        return send(res, 502, { error: "empty_output" });
-      }
-      if (st === "failed" || st === "canceled") {
-        return send(res, 502, { error: "replicate_failed", details: check.data.error || check.data });
-      }
-      // otherwise: starting/processing → נמשיך לחכות
+    // 2) אין R_TOKEN? — אם יש Fal, נשתמש בו ישירות
+    if (FAL_KEY) {
+      const fal = await falGenerate(prompt, width, height, steps, guidance);
+      return send(res, fal.status, fal.ok ? fal.data : { error: "fal_error", details: fal.data });
     }
 
-    return send(res, 504, { error: "replicate_timeout" });
+    // 3) אין אף ספק
+    return send(res, 500, { error: "server_misconfig", details: "No REPLICATE_TOKEN or FAL_KEY configured" });
 
   } catch (e) {
     console.log("[Server] /image exception:", e);
@@ -216,20 +291,16 @@ async function handleListModels(req, res) {
 const server = http.createServer((req, res) => {
   const u = url.parse(req.url, true);
 
-  // Preflight
   if (req.method === "OPTIONS") { res.writeHead(204, CORS_HEADERS); return res.end(); }
 
-  // Health
   if (req.method === "GET" && (u.pathname === "/" || u.pathname === "/health")) {
     return send(res, 200, { ok: true, model: G_MODEL });
   }
 
-  // Debug: list models available for this key
   if (req.method === "GET" && u.pathname === "/debug/models") {
     return handleListModels(req, res);
   }
 
-  // Prompt
   if (req.method === "POST" && u.pathname === "/prompt") {
     let body = "";
     req.on("data", ch => (body += ch));
@@ -237,7 +308,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Image
   if (req.method === "POST" && u.pathname === "/image") {
     let body = "";
     req.on("data", ch => (body += ch));
