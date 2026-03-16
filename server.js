@@ -1,26 +1,31 @@
-// NailAI Proxy — Leonardo Edition (Node 20)
-// -----------------------------------------
+// NailAI Proxy — Leonardo Edition (Node 20) — with smart defaults
+// ---------------------------------------------------------------
 // Endpoints:
 //   GET  /health          -> סטטוס חיים
-//   GET  /leonardo-test   -> בדיקה שה-LEONARDO_KEY תקין (ענן->ענן)
-//   POST /prompt          -> Gemini v1 (טקסט פרומפט)
-//   POST /image           -> Leonardo (יצירה אסינכרונית: POST /generations + polling GET /generations/{id})
+//   GET  /leonardo-test   -> אימות ה-API Key מול Leonardo (ענן->ענן)
+//   POST /prompt          -> Gemini v1 (יצירת טקסט prompt)
+//   POST /image           -> Leonardo (POST /generations + polling GET /generations/{id})
 //
 // ENV (Render -> Settings -> Environment):
 //   GOOGLE_AI_KEY   = <מפתח Gemini>
 //   GEMINI_MODEL    = gemini-2.5-flash
 //   LEONARDO_KEY    = <API KEY של Leonardo>  // בלי "Bearer"
-//   LEONARDO_MODEL  = <UUID של מודל Leonardo> // לדוגמה Flux Schnell: 1dd50843-d653-4516-a8e3-f0238ee453ff
+//   LEONARDO_MODEL  = <UUID של מודל>         // Flux Schnell לדוגמה: 1dd50843-d653-4516-a8e3-f0238ee453ff
 //
-// עובדות תיעוד:
-// - בסיס ה-API של Leonardo: https://cloud.leonardo.ai/api/rest/v1 (Bearer Auth).  [docs] 
-// - יצירה אסינכרונית: POST /generations -> אח"כ GET /generations/{id} עד שיש generated_images.  [docs]
-// - מודלים מזוהים ע"י UUID, לא בשם טקסטואלי.  [docs]
+//   DEFAULT_STEPS    = 32         (אופציונלי; אם לא – נשתמש בקוד)
+//   DEFAULT_GUIDANCE = 4.0        (אופציונלי; אם לא – נשתמש בקוד)
+//   DEFAULT_NEGATIVE = "..."
+//   DEFAULT_WIDTH    = 768
+//   DEFAULT_HEIGHT   = 1024
 //
-// (הערות התיעוד: [1](https://huggingface.co/black-forest-labs/FLUX.1-schnell/discussions/154)[2](https://replicate.com/black-forest-labs/flux-schnell)[3](https://fal.ai/docs/documentation/development/getting-started/deploy-your-first-image-generator)[4](https://www.ai-engine.net/blog/generate-ai-images-api))
+// הערות:
+// - בסיס ה-API של Leonardo: https://cloud.leonardo.ai/api/rest/v1  (Authorization: Bearer <API_KEY>)
+// - flow אסינכרוני: POST /generations -> קבלת generationId -> polling GET /generations/{id} עד שיש generated_images
+// - modelId חייב להיות UUID
+// ---------------------------------------------------------------
 
 const http = require("http");
-const url = require("url");
+const url  = require("url");
 
 const PORT  = process.env.PORT || 10000;
 
@@ -31,6 +36,15 @@ const G_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 // Leonardo
 const L_KEY   = process.env.LEONARDO_KEY;   // רק ה-KEY (בלי "Bearer")
 const L_MODEL = process.env.LEONARDO_MODEL; // UUID של המודל
+
+// Defaults (ENV > קוד)
+const FALLBACK_NEGATIVE =
+  "extra fingers, six fingers, fused fingers, missing digits, deformed hand, wrong anatomy, mangled, distorted wrist, elongated unnatural fingers";
+const DEF_STEPS    = Number(process.env.DEFAULT_STEPS ?? 32);
+const DEF_GUIDANCE = Number(process.env.DEFAULT_GUIDANCE ?? 4.0);
+const DEF_NEGATIVE = String(process.env.DEFAULT_NEGATIVE ?? FALLBACK_NEGATIVE);
+const DEF_WIDTH    = Number(process.env.DEFAULT_WIDTH ?? 768);
+const DEF_HEIGHT   = Number(process.env.DEFAULT_HEIGHT ?? 1024);
 
 // CORS
 const CORS_HEADERS = {
@@ -52,15 +66,39 @@ async function fetchJSON(endpoint, init = {}, timeoutMs = 20000) {
     const r = await fetch(endpoint, { ...init, signal: controller.signal });
     const data = await r.json().catch(() => ({}));
     return { r, data };
-  } finally { clearTimeout(t); }
+  } finally {
+    clearTimeout(t);
+  }
 }
 
-// ------------------------------ /health -------------------------------------
+// ---------- helpers ----------
+const clamp = (n, min, max) => Math.min(Math.max(n, min), max);
+function toInt(v, def) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.trunc(n) : def;
+}
+function toFloat(v, def) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
+// ============================== /health =====================================
 function handleHealth(req, res) {
-  return send(res, 200, { ok: true, promptModel: G_MODEL || null, imageModel: L_MODEL || null });
+  return send(res, 200, {
+    ok: true,
+    promptModel: G_MODEL || null,
+    imageModel: L_MODEL || null,
+    defaults: {
+      steps: DEF_STEPS,
+      guidance: DEF_GUIDANCE,
+      width: DEF_WIDTH,
+      height: DEF_HEIGHT,
+      negativePrompt: DEF_NEGATIVE.slice(0, 64) + (DEF_NEGATIVE.length > 64 ? "…" : "")
+    }
+  });
 }
 
-// --------------------------- /leonardo-test ---------------------------------
+// ============================ /leonardo-test ================================
 async function handleLeonardoTest(req, res) {
   if (!L_KEY) return send(res, 500, { error: "missing_LEONARDO_KEY" });
 
@@ -75,7 +113,7 @@ async function handleLeonardoTest(req, res) {
   return send(res, r.status, data);
 }
 
-// -------------------------------- /prompt -----------------------------------
+// ================================ /prompt ===================================
 async function handlePrompt(req, res, body) {
   try {
     if (!G_KEY) return send(res, 500, { error: "missing_GOOGLE_AI_KEY" });
@@ -114,31 +152,10 @@ Studio background, soft natural light.`;
   }
 }
 
-// -------------------------------- /image ------------------------------------
-// נשלחת בקשה ל-Leonardo עם פרמטרים אופציונליים לתיקון אנטומיה:
-// body:
-//   prompt           (חובה)
-//   width,height     (ברירת מחדל 768x1024)
-//   numImages        (ברירת מחדל 1)
-//   negativePrompt   (מחרוזת אופציונלית)
-//   steps            (מספר אופציונלי)
-//   guidance         (מספר אופציונלי)
-async function leonardoCreate({
-  prompt, width = 768, height = 1024, numImages = 1, negativePrompt = "", steps, guidance,
-}) {
+// ================================ /image ====================================
+// Leonardo: POST /generations -> generationId -> polling GET /generations/{id}
+async function leonardoCreate(payload) {
   const endpoint = "https://cloud.leonardo.ai/api/rest/v1/generations";
-
-  const payload = {
-    prompt,
-    modelId: L_MODEL,        // UUID תקף
-    width,
-    height,
-    num_images: numImages,
-    ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
-    ...(steps ? { steps } : {}),
-    ...(typeof guidance === "number" ? { guidance } : {})
-  };
-
   return fetchJSON(endpoint, {
     method: "POST",
     headers: {
@@ -149,7 +166,6 @@ async function leonardoCreate({
     body: JSON.stringify(payload)
   });
 }
-
 async function leonardoGet(generationId) {
   const endpoint = `https://cloud.leonardo.ai/api/rest/v1/generations/${generationId}`;
   return fetchJSON(endpoint, {
@@ -166,31 +182,43 @@ async function handleImage(req, res, body) {
     if (!L_KEY)   return send(res, 500, { error: "missing_LEONARDO_KEY" });
     if (!L_MODEL) return send(res, 500, { error: "missing_LEONARDO_MODEL_UUID" });
 
-    const {
+    const b = JSON.parse(body || "{}");
+
+    // --- קלט מהלקוח או ברירות-מחדל חכמות ---
+    const prompt   = String(b.prompt || "").trim();
+    if (!prompt) return send(res, 400, { error: "missing_prompt" });
+
+    const width    = clamp(toInt(b.width  ?? DEF_WIDTH,  DEF_WIDTH),  256, 2048);
+    const height   = clamp(toInt(b.height ?? DEF_HEIGHT, DEF_HEIGHT), 256, 2048);
+    const numImgs  = clamp(toInt(b.numImages ?? 1, 1), 1, 4);
+
+    const steps    = clamp(toInt(b.steps ?? DEF_STEPS, DEF_STEPS), 10, 80);
+    const guidance = clamp(toFloat(b.guidance ?? DEF_GUIDANCE, DEF_GUIDANCE), 0.0, 20.0);
+
+    const negative = String(
+      (b.negativePrompt && String(b.negativePrompt).trim().length > 0)
+        ? b.negativePrompt
+        : DEF_NEGATIVE
+    );
+
+    // --- יצירה ---
+    const payload = {
       prompt,
-      width = 768,
-      height = 1024,
-      numImages = 1,
-      negativePrompt = "",
+      modelId: L_MODEL,
+      width,
+      height,
+      num_images: numImgs,
+      negative_prompt: negative,
       steps,
       guidance
-    } = JSON.parse(body || "{}");
+    };
 
-    if (!prompt || String(prompt).trim().length === 0) {
-      return send(res, 400, { error: "missing_prompt" });
-    }
-
-    // 1) יצירה
-    const { r: rCreate, data: dCreate } = await leonardoCreate({
-      prompt, width, height, numImages, negativePrompt, steps, guidance
-    });
-
+    const { r: rCreate, data: dCreate } = await leonardoCreate(payload);
     if (!rCreate.ok) {
       console.log("[Leonardo] create status:", rCreate.status, "body:", dCreate);
       return send(res, rCreate.status, { error: "leonardo_error", details: dCreate });
     }
 
-    // 2) polling עד שיש תמונה
     const genId =
       dCreate?.sdGenerationJob?.generationId ||
       dCreate?.generationId ||
@@ -198,6 +226,7 @@ async function handleImage(req, res, body) {
 
     if (!genId) return send(res, 500, { error: "no_generation_id", raw: dCreate });
 
+    // --- Polling ---
     for (let i = 0; i < 60; i++) { // עד ~120 שניות
       await delay(2000);
 
@@ -219,7 +248,15 @@ async function handleImage(req, res, body) {
       if (Array.isArray(imagesArr) && imagesArr.length > 0) {
         const url = imagesArr[0]?.url;
         if (url) {
-          return send(res, 200, { imageUrl: url, provider: "leonardo", modelUsed: L_MODEL });
+          return send(res, 200, {
+            imageUrl: url,
+            provider: "leonardo",
+            modelUsed: L_MODEL,
+            usedParameters: {
+              width, height, steps, guidance,
+              negativePrompt: negative.slice(0, 120) + (negative.length > 120 ? "…" : "")
+            }
+          });
         }
       }
 
