@@ -2,20 +2,20 @@
 // -----------------------------------------
 // Endpoints:
 //   GET  /health          -> סטטוס חיים
-//   GET  /leonardo-test   -> בדיקת מפתח Leonardo בענן (ענן->ענן)
+//   GET  /leonardo-test   -> בדיקת Leonardo API Key מהענן (ענן->ענן)
 //   POST /prompt          -> Gemini v1 (יצירת טקסט prompt)
 //   POST /image           -> Leonardo (POST /generations + polling GET /generations/{id})
 //
 // ENV (Render -> Settings -> Environment):
 //   GOOGLE_AI_KEY   = <מפתח Gemini>
 //   GEMINI_MODEL    = gemini-2.5-flash
-//   LEONARDO_KEY    = <API KEY של Leonardo>  // בלי "Bearer"
+//   LEONARDO_KEY    = <API KEY של Leonardo>  // רק ה-KEY, בלי "Bearer"
 //   LEONARDO_MODEL  = <UUID של מודל Leonardo> // לדוגמה Flux Schnell: 1dd50843-d653-4516-a8e3-f0238ee453ff
 //
 // הערות:
-// - בסיס ה-API של Leonardo: https://cloud.leonardo.ai/api/rest/v1  (Bearer <API_KEY>)
+// - בסיס ה-API של Leonardo: https://cloud.leonardo.ai/api/rest/v1  (Authorization: Bearer <API_KEY>)
 // - יצירה אסינכרונית: POST /generations -> אח"כ GET /generations/{id} עד שיש generated_images
-// - שימו לב למיפוי שמות הפרמטרים עבור Leonardo:
+// - מיפוי שמות פרמטרים לפרודקשן של Leonardo:
 //     steps            -> num_inference_steps
 //     guidance         -> guidance_scale
 //     negativePrompt   -> negative_prompt
@@ -118,15 +118,15 @@ Studio background, soft natural light.`;
 }
 
 /* -------------------------------- /image ----------------------------------- */
-// body שמתקבל מהלקוח (Flutter / Hoppscotch):
+// גוף הבקשה (מהקליינט) יכול לכלול:
 // {
 //   "prompt": "...",           // חובה
-//   "width": 768,              // אופציונלי (ברירת מחדל 768)
-//   "height": 1024,            // אופציונלי (ברירת מחדל 1024)
+//   "width": 768,              // אופציונלי
+//   "height": 1024,            // אופציונלי
 //   "numImages": 1,            // אופציונלי
 //   "negativePrompt": "...",   // אופציונלי
-//   "steps": 32,               // אופציונלי (ימופה ל-num_inference_steps)
-//   "guidance": 4.0            // אופציונלי (ימופה ל-guidance_scale)
+//   "steps": 36,               // אופציונלי (ימופה ל-num_inference_steps)
+//   "guidance": 4.8            // אופציונלי (ימופה ל-guidance_scale)
 // }
 
 async function leonardoCreate({
@@ -135,12 +135,12 @@ async function leonardoCreate({
   height = 1024,
   numImages = 1,
   negativePrompt = "",
-  steps,      // יגיע מהלקוח
-  guidance,   // יגיע מהלקוח
+  steps,
+  guidance,
 }) {
   const endpoint = "https://cloud.leonardo.ai/api/rest/v1/generations";
 
-  // מיפוי שמות לשדות ש-Leonardo מצפה להם:
+  // מיפוי לשמות שמצפה להם ה-Production API של Leonardo
   const payload = {
     prompt,
     modelId: L_MODEL,                 // UUID תקף
