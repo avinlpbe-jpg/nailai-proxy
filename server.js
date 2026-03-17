@@ -1,26 +1,23 @@
 // NailAI Proxy — Leonardo Edition (Node 20)
 // -----------------------------------------
 // Endpoints:
-//   GET  /health          -> סטטוס חיים
-//   GET  /leonardo-test   -> בדיקת Leonardo API Key (ענן->ענן)
-//   POST /prompt          -> Gemini v1 (טקסט prompt)
-//   POST /image           -> Leonardo (POST /generations + polling GET /generations/{id})
+//   GET  /health
+//   GET  /leonardo-test
+//   POST /prompt
+//   POST /image
 //
 // ENV (Render -> Settings -> Environment):
 //   GOOGLE_AI_KEY   = <מפתח Gemini>
 //   GEMINI_MODEL    = gemini-2.5-flash
 //   LEONARDO_KEY    = <API KEY של Leonardo>  // רק ה-KEY, בלי "Bearer"
-//   LEONARDO_MODEL  = <UUID של מודל Leonardo> // Flux Schnell: 1dd50843-d653-4516-a8e3-f0238ee453ff
+//   LEONARDO_MODEL  = <UUID של מודל Leonardo>
+//     // Flux Schnell: 1dd50843-d653-4516-a8e3-f0238ee453ff
+//     // Phoenix 1.0 : de7d3faf-762f-48e0-b3b7-9d0ac3a3fcf3
 //
-// הערות:
-// - בסיס ה-API של Leonardo: https://cloud.leonardo.ai/api/rest/v1 (Authorization: Bearer <API_KEY>)
-// - יצירה אסינכרונית: POST /generations -> GET /generations/{id} עד שיש generated_images
-// - מיפוי פרמטרים:
-//     steps            -> num_inference_steps
-//     guidance         -> guidance_scale
-//     negativePrompt   -> negative_prompt
-//
-// Node 20 כולל fetch גלובלי.
+// מיפוי ל-Leonardo:
+//   steps            -> num_inference_steps
+//   guidance         -> guidance_scale
+//   negativePrompt   -> negative_prompt
 
 const http = require("http");
 const url = require("url");
@@ -32,8 +29,8 @@ const G_KEY   = process.env.GOOGLE_AI_KEY;
 const G_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 // Leonardo
-const L_KEY   = process.env.LEONARDO_KEY;   // רק ה-KEY
-const L_MODEL = process.env.LEONARDO_MODEL; // UUID
+const L_KEY   = process.env.LEONARDO_KEY;
+const L_MODEL = process.env.LEONARDO_MODEL;
 
 // CORS
 const CORS_HEADERS = {
@@ -115,8 +112,6 @@ Studio background, soft natural light.`;
 }
 
 /* -------------------------------- /image ----------------------------------- */
-// גוף בקשה מהקליינט:
-// { prompt, width, height, numImages, negativePrompt, steps, guidance }
 async function leonardoCreate({
   prompt,
   width = 768,
@@ -127,10 +122,9 @@ async function leonardoCreate({
   guidance,
 }) {
   const endpoint = "https://cloud.leonardo.ai/api/rest/v1/generations";
-
   const payload = {
     prompt,
-    modelId: L_MODEL,                 // UUID תקף
+    modelId: L_MODEL,
     width,
     height,
     num_images: numImages,
@@ -138,7 +132,6 @@ async function leonardoCreate({
     ...(typeof steps === "number"    ? { num_inference_steps: steps } : {}),
     ...(typeof guidance === "number" ? { guidance_scale: guidance } : {}),
   };
-
   return fetchJSON(endpoint, {
     method: "POST",
     headers: {
@@ -184,7 +177,6 @@ async function handleImage(req, res, body) {
     const { r: rCreate, data: dCreate } = await leonardoCreate({
       prompt, width, height, numImages, negativePrompt, steps, guidance
     });
-
     if (!rCreate.ok) {
       console.log("[Leonardo] create status:", rCreate.status, "body:", dCreate);
       return send(res, rCreate.status, { error: "leonardo_error", details: dCreate });
@@ -195,12 +187,10 @@ async function handleImage(req, res, body) {
       dCreate?.sdGenerationJob?.generationId ||
       dCreate?.generationId ||
       dCreate?.id;
-
     if (!genId) return send(res, 500, { error: "no_generation_id", raw: dCreate });
 
     for (let i = 0; i < 60; i++) { // עד ~120 שניות
       await delay(2000);
-
       const { r: rGet, data: dGet } = await leonardoGet(genId);
       if (!rGet.ok) {
         console.log("[Leonardo] get status:", rGet.status, "body:", dGet);
@@ -226,11 +216,9 @@ async function handleImage(req, res, body) {
       if (String(status).toUpperCase().includes("FAILED")) {
         return send(res, 502, { error: "leonardo_failed", details: dGet });
       }
-      // אחרת: PENDING/PROCESSING → נמשיך להמתין
     }
 
     return send(res, 504, { error: "leonardo_timeout" });
-
   } catch (e) {
     console.log("[/image] exception:", e);
     return send(res, 500, { error: "server_exception", details: String(e) });
@@ -241,27 +229,15 @@ async function handleImage(req, res, body) {
 const server = http.createServer((req, res) => {
   const u = url.parse(req.url, true);
 
-  if (req.method === "OPTIONS") {
-    res.writeHead(204, CORS_HEADERS);
-    return res.end();
+  if (req.method === "OPTIONS") { res.writeHead(204, CORS_HEADERS); return res.end(); }
+  if (req.method === "GET"  && (u.pathname === "/" || u.pathname === "/health")) return handleHealth(req, res);
+  if (req.method === "GET"  &&  u.pathname === "/leonardo-test")                return handleLeonardoTest(req, res);
+  if (req.method === "POST" &&  u.pathname === "/prompt") {
+    let body=""; req.on("data",c=>body+=c); req.on("end",()=>handlePrompt(req,res,body)); return;
   }
-
-  if (req.method === "GET" && (u.pathname === "/" || u.pathname === "/health")) {
-    return handleHealth(req, res);
+  if (req.method === "POST" &&  u.pathname === "/image") {
+    let body=""; req.on("data",c=>body+=c); req.on("end",()=>handleImage(req,res,body)); return;
   }
-
-  if (req.method === "GET" && u.pathname === "/leonardo-test") {
-    return handleLeonardoTest(req, res);
-  }
-
-  if (req.method === "POST" && u.pathname === "/prompt") {
-    let body = ""; req.on("data", c => (body += c)); req.on("end", () => handlePrompt(req, res, body)); return;
-  }
-
-  if (req.method === "POST" && u.pathname === "/image") {
-    let body = ""; req.on("data", c => (body += c)); req.on("end", () => handleImage(req, res, body)); return;
-  }
-
   return send(res, 404, { error: "not_found" });
 });
 
